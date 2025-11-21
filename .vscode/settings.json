@@ -1,0 +1,15 @@
+{
+  "editor.formatOnSave": true,
+  "editor.defaultFormatter": "esbenp.prettier-vscode",
+  "prettier.requireConfig": false,
+  "[python]": {
+    "editor.formatOnSave": true,
+    "editor.codeActionsOnSave": ["source.organizeImports"],
+    "editor.defaultFormatter": "charliermarsh.ruff"
+  },
+  "[toml]": { "editor.defaultFormatter": "tamasfe.even-better-toml" },
+  "ruff.lineLength": 99,
+  "files.exclude": {
+    ".cache": true
+  }
+}
