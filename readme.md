@@ -5,6 +5,7 @@ Minimal scripts to run actions across multiple Web3 accounts (one script = one a
 ## Current scripts
 
 - `hyperevm-kinetiq.py` – check eligibility for Kinetiq on HyperEVM via their terms endpoint.
+- `hyperevm-route.py` – HyperEVM & Unit warm-up flow.
 
 ## How to install
 
@@ -15,12 +16,6 @@ cd web3-cybil-tools
 
 # install dependencies
 pip install -r requirements.txt
-```
-
-Run a script:
-
-```sh
-python hyperevm-kinetiq.py
 ```
 
 ## Disclaimer

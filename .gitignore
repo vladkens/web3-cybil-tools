@@ -1,2 +1,6 @@
+_cex_map.txt
 _proxies.txt
 _wallets.txt
+.*.json
+.cache/
+.env

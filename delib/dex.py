@@ -1,0 +1,519 @@
+import json
+import textwrap
+import time
+from datetime import UTC, datetime
+
+from eth_account.messages import encode_defunct, encode_typed_data
+from hyperliquid.utils.signing import user_signed_payload
+from loguru import logger
+
+from .evm import Erc20, LocalAccount, Web3, evm_call, to_addr
+from .utils import CltManager
+
+HYPURR_FI = "0xceCcE0EB9DD2Ef7996e01e25DD70e461F918A14b"
+
+
+# https://app.hyperunit.xyz/
+class HyperUnit:
+    @classmethod
+    def mk_clt(cls, addr: str):
+        hdr = {"referer": "https://app.hyperunit.xyz/", "origin": "https://app.hyperunit.xyz"}
+        return CltManager.create(addr, hdr)
+
+    @classmethod
+    def sign_terms(cls, acc: LocalAccount):
+        clt = cls.mk_clt(acc.address)
+        hdr = {
+            "privy-app-id": "cm57ezkm403tzgjwk6oa5xyis",
+            "privy-ca-id": "ecf696c2-6765-426d-9f3e-f79a790ff0dc",
+            "privy-client": "react-auth:2.6.2",
+        }
+
+        rep = clt.post(
+            "https://auth.privy.io/api/v1/siwe/init",
+            headers=hdr,
+            json={"address": str(acc.address)},
+        )
+
+        logger.debug(f"sign_hyperunit: {rep.status_code} {rep.text}")
+        rep.raise_for_status()
+        dat = rep.json()
+
+        cat = datetime.now(tz=UTC).isoformat(timespec="milliseconds")
+        cat = cat.replace("+00:00", "Z")
+
+        txt = f"""
+        app.hyperunit.xyz wants you to sign in with your Ethereum account:
+        {dat["address"]}
+
+        By signing, you are proving you own this wallet and logging in. This does not initiate a transaction or cost any fees.
+
+        URI: https://app.hyperunit.xyz
+        Version: 1
+        Chain ID: 1
+        Nonce: {dat["nonce"]}
+        Issued At: {cat}
+        Resources:
+        - https://privy.io
+        """
+
+        txt = textwrap.dedent(txt).strip()
+        msg = encode_defunct(text=txt)
+        sig = acc.sign_message(msg)
+
+        rep = clt.post(
+            "https://auth.privy.io/api/v1/siwe/authenticate",
+            headers=hdr,
+            json={
+                "message": txt,
+                "signature": f"0x{sig.signature.hex()}",
+                "chainId": "eip155:1",
+                "walletClientType": "rabby_wallet",
+                "connectorType": "injected",
+                "mode": "login-or-sign-up",
+            },
+        )
+
+        logger.debug(f"sign_hyperunit auth: {rep.status_code} {rep.text}")
+        rep.raise_for_status()
+
+        dat = rep.json()
+        if dat["user"]["has_accepted_terms"]:
+            return True
+
+        rep = clt.post(
+            "https://auth.privy.io/api/v1/users/me/accept_terms",
+            headers={**hdr, "authorization": f"Bearer {dat['token']}"},
+            json={},
+        )
+
+        logger.debug(f"sign_hyperunit accept_terms: {rep.status_code} {rep.text}")
+        rep.raise_for_status()
+        return True
+
+    @classmethod
+    def get_dep_addr(cls, acc: LocalAccount, fchain: str, tchain: str, asset: str):
+        fchain, tchain, asset = fchain.lower(), tchain.lower(), asset.lower()
+
+        allowed_chains = ("hyperliquid", "ethereum", "bitcoin", "solana")
+        assert fchain in allowed_chains, f"Unsupported from chain: {fchain}"
+        assert tchain in allowed_chains, f"Unsupported to chain: {tchain}"
+
+        clt = cls.mk_clt(acc.address)
+        rep = clt.get(f"https://api.hyperunit.xyz/gen/{fchain}/{tchain}/{asset}/{acc.address}")
+        rep.raise_for_status()
+
+        dat = rep.json()
+        assert dat["status"] == "OK", f"Unit deposit address fetch failed: {dat}"
+        dep_addr = to_addr(Web3(), dat["address"])
+        return str(dep_addr)
+
+    @classmethod
+    def get_ops(cls, acc: LocalAccount) -> dict:
+        clt = cls.mk_clt(acc.address)
+        url = f"https://api.hyperunit.xyz/operations/{acc.address}"
+        rep = clt.get(url)
+        rep.raise_for_status()
+        return rep.json()["operations"]
+
+    @classmethod
+    def wait_ongoing_ops(cls, acc: LocalAccount, expect_ops: int):
+        def _check_all_done():
+            ops = cls.get_ops(acc)
+            assert len(ops) >= expect_ops, "Unit task not appeared yet"
+
+            ongoing = [x for x in ops if x.get("state") not in ("done",)]
+            assert len(ongoing) == 0, f"Unit operations still ongoing: {len(ongoing)}"
+            return True
+
+        while True:
+            try:
+                return _check_all_done()
+            except AssertionError as e:
+                logger.debug(f"unit_wait_ongoing err {type(e)}: {e}")
+                # time.sleep(random.uniform(5, 10))
+                time.sleep(15)
+
+    @classmethod
+    def widthdraw(cls, acc: LocalAccount, token: str, amount: float):
+        assert ":" in token, "Token must be in format SYMBOL:contract_address"
+        clt = cls.mk_clt(acc.address)
+        uts = int(time.time() * 1000)
+
+        # todo: right now only UETH supported
+        token_name = token.split(":")[0].lower()
+        assert token_name == "ueth", f"Only UETH withdrawals supported, got {token_name}"
+
+        dep_addr = cls.get_dep_addr(acc, "hyperliquid", "ethereum", "eth")
+
+        msg = {
+            "signatureChainId": "0x1",
+            "hyperliquidChain": "Mainnet",
+            "destination": dep_addr,
+            "token": token,
+            "amount": str(amount),
+            "time": uts,
+        }
+
+        dat = user_signed_payload(
+            "HyperliquidTransaction:SpotSend",
+            [
+                {"name": "hyperliquidChain", "type": "string"},
+                {"name": "destination", "type": "string"},
+                {"name": "token", "type": "string"},
+                {"name": "amount", "type": "string"},
+                {"name": "time", "type": "uint64"},
+            ],
+            msg,
+        )
+
+        sig = acc.sign_message(encode_typed_data(full_message=dat))
+        dat = {
+            "action": {"type": "spotSend", **msg},
+            "nonce": uts,
+            "signature": {"r": f"0x{sig.r:064x}", "s": f"0x{sig.s:064x}", "v": sig.v},
+        }
+
+        rep = clt.post("https://api.hyperliquid.xyz/exchange", json=dat)
+        rep.raise_for_status()
+
+        res = rep.json()
+        assert res["status"] == "ok", f"Unit withdraw failed: {rep.text}"
+
+
+# https://app.hypurr.fi/
+class Hypurr:
+    @classmethod
+    def supply(cls, w3: Web3, ac: LocalAccount, caddr: str, amount: int) -> str:
+        caddr = to_addr(w3, caddr)
+        Erc20.check_approve(w3, ac, caddr, HYPURR_FI, amount)
+
+        fn = {
+            "name": "supply",
+            "type": "function",
+            "constant": False,
+            "inputs": [
+                {"name": "asset", "type": "address"},
+                {"name": "amount", "type": "uint256"},
+                {"name": "on_behalf_of", "type": "address"},
+                {"name": "referral_code", "type": "uint16"},
+            ],
+            "outputs": [],
+        }
+
+        hypurr = w3.eth.contract(address=to_addr(w3, HYPURR_FI), abi=[fn])
+        rs = evm_call(w3, ac, hypurr.functions.supply(caddr, amount, ac.address, 0))
+        logger.debug(f"hypurr_supply: {json.dumps(rs)}")
+        return rs
+
+    @classmethod
+    def get_account_data(cls, w3: Web3, user_addr: str) -> dict:
+        user_addr = to_addr(w3, user_addr)
+
+        fn = {
+            "name": "getUserAccountData",
+            "type": "function",
+            "constant": True,
+            "inputs": [{"name": "user", "type": "address"}],
+            "outputs": [
+                {"name": "totalCollateralBase", "type": "uint256"},
+                {"name": "totalDebtBase", "type": "uint256"},
+                {"name": "availableBorrowsBase", "type": "uint256"},
+                {"name": "currentLiquidationThreshold", "type": "uint256"},
+                {"name": "ltv", "type": "uint256"},
+                {"name": "healthFactor", "type": "uint256"},
+            ],
+        }
+
+        pool = w3.eth.contract(address=to_addr(w3, HYPURR_FI), abi=[fn])
+        result = pool.functions.getUserAccountData(user_addr).call()
+
+        return {
+            "totalCollateral": result[0],
+            "totalDebt": result[1],
+            "availableBorrows": result[2],
+            "liquidationThreshold": result[3],
+            "ltv": result[4],
+            "healthFactor": result[5],
+        }
+
+    @classmethod
+    def borrow(cls, w3: Web3, ac: LocalAccount, caddr: str, amount: int) -> str:
+        caddr = to_addr(w3, caddr)
+        # Erc20.check_approve(w3, ac, caddr, caddr, amount)
+
+        fn = {
+            "name": "borrow",
+            "type": "function",
+            "constant": False,
+            "inputs": [
+                {"name": "asset", "type": "address"},
+                {"name": "amount", "type": "uint256"},
+                {"name": "interest_rate_mode", "type": "uint256"},
+                {"name": "referral_code", "type": "uint16"},
+                {"name": "on_behalf_of", "type": "address"},
+            ],
+            "outputs": [],
+        }
+
+        hypurr = w3.eth.contract(address=to_addr(w3, HYPURR_FI), abi=[fn])
+        rs = evm_call(w3, ac, hypurr.functions.borrow(caddr, amount, 2, 0, ac.address))
+        logger.debug(f"hypurr_borrow: {json.dumps(rs)}")
+        return rs
+
+    @classmethod
+    def repay(cls, w3: Web3, ac: LocalAccount, caddr: str, amount: int) -> str:
+        caddr = to_addr(w3, caddr)
+        Erc20.check_approve(w3, ac, caddr, HYPURR_FI, amount)
+
+        fn = {
+            "name": "repay",
+            "type": "function",
+            "constant": False,
+            "inputs": [
+                {"name": "asset", "type": "address"},
+                {"name": "amount", "type": "uint256"},
+                {"name": "interest_rate_mode", "type": "uint256"},
+                {"name": "on_behalf_of", "type": "address"},
+            ],
+            "outputs": [{"name": "", "type": "uint256"}],
+        }
+
+        hypurr = w3.eth.contract(address=to_addr(w3, HYPURR_FI), abi=[fn])
+        rs = evm_call(w3, ac, hypurr.functions.repay(caddr, amount, 2, ac.address))
+        logger.debug(f"hypurr_repay: {json.dumps(rs)}")
+        return rs
+
+    @classmethod
+    def withdraw(cls, w3: Web3, ac: LocalAccount, caddr: str, amount: int) -> str:
+        caddr = to_addr(w3, caddr)
+        # Erc20.check_approve(w3, ac, caddr, HYPURR_FI, amount)
+
+        fn = {
+            "name": "withdraw",
+            "type": "function",
+            "constant": False,
+            "inputs": [
+                {"name": "asset", "type": "address"},
+                {"name": "amount", "type": "uint256"},
+                {"name": "to", "type": "address"},
+            ],
+        }
+
+        hypurr = w3.eth.contract(address=to_addr(w3, HYPURR_FI), abi=[fn])
+        rs = evm_call(w3, ac, hypurr.functions.withdraw(caddr, amount, ac.address))
+        logger.debug(f"hypurr_withdraw: {json.dumps(rs)}")
+        return rs
+
+    @classmethod
+    def swap(
+        cls,
+        w3: Web3,
+        ac: LocalAccount,
+        src_token: str,
+        dst_token: str,
+        amount: int,
+    ):
+        src_token = to_addr(w3, src_token)
+        dst_token = to_addr(w3, dst_token)
+
+        dat = {
+            "inputToken": str(src_token),
+            "outputToken": str(dst_token),
+            "inputAmount": amount,
+            "userAddress": str(ac.address),
+            "outputReceiver": str(ac.address),
+            "chainID": "hyperevm",
+            "uniquePID": "657a8d5a95d73a70a4b49319544a42ad61d689c83679fcfe6b80e8e9b51cfe2c",
+            "surgeProtection": True,
+            "activateSurplusFee": True,
+            "partnerAddress": "0xe5FE403dB2577B05678a11cEea4a6f89FD15E304",
+            "partnerFee": 25,
+        }
+
+        clt = CltManager.create(ac.address)
+        rep = clt.post(
+            "https://router.gluex.xyz/v1/quote",
+            headers={
+                "x-api-key": "SVQkMIOLo9O2NpA0xI0pQGPV1FYIYXmk",
+                "origin": "https://app.hypurr.fi",
+                "referer": "https://app.hypurr.fi/swap",
+            },
+            json=dat,
+        )
+
+        # logger.debug(f"gluex_swap: {rep.status_code} {rep.text}")
+        rep.raise_for_status()
+
+        dat = rep.json()
+        assert "statusCode" in dat and "result" in dat, f"GlueX swap quote failed: {dat}"
+        assert dat["statusCode"] == 200, f"GlueX swap quote failed: {dat}"
+        dat = dat["result"]
+
+        Erc20.check_approve(w3, ac, src_token, dat["router"], int(dat["inputAmount"]))
+
+        params = {
+            "to": to_addr(w3, dat["router"]),
+            "data": dat["calldata"],
+            "gas": int(dat["computationUnits"]),
+        }
+
+        return evm_call(w3, ac, params)
+
+
+# https://app.valantis.xyz/
+class Valantis:
+    @classmethod
+    def mk_clt(cls, addr: str):
+        hdr = {"origin": "https://app.valantis.xyz", "referer": "https://app.valantis.xyz/"}
+        return CltManager.create(addr, hdr)
+
+    @classmethod
+    def swap(cls, w3: Web3, ac: LocalAccount, src_token: str, dst_token: str, amount: int):
+        src_token = to_addr(w3, src_token)
+        dst_token = to_addr(w3, dst_token)
+
+        dat = {
+            "inputToken": str(src_token),
+            "outputToken": str(dst_token),
+            "inputAmount": str(amount),
+            "userAddress": str(ac.address),
+            "outputReceiver": str(ac.address),
+            "chainID": "hyperevm",
+            "isPermit2": False,
+        }
+
+        clt = cls.mk_clt(ac.address)
+        rep = clt.post(
+            "https://analytics-v3.valantis-analytics.xyz/gluex_quote_with_surplus",
+            headers={"authorization": "Bearer f2ffd7876ec03f1f4a04ed88402b1802"},
+            json=dat,
+        )
+        rep.raise_for_status()
+
+        res = rep.json()
+        assert "statusCode" in res and "result" in res, f"GlueX swap quote failed: {res}"
+        assert res["statusCode"] == 200, f"GlueX swap quote failed: {res}"
+        res = res["result"]
+
+        assert "calldata" in res and "router" in res, (
+            f"GlueX swap data missing:\n{json.dumps(dat)}\n{json.dumps(res)}"
+        )
+
+        Erc20.check_approve(w3, ac, src_token, res["router"], int(res["inputAmount"]))
+
+        params = {
+            "to": to_addr(w3, res["router"]),
+            "data": res["calldata"],
+            "gas": int(res["computationUnits"]),
+        }
+
+        return evm_call(w3, ac, params)
+
+    @classmethod
+    def prices(cls):
+        dat = {
+            "chainId": 999,
+            "addresses": [
+                "0x0000000000000000000000000000000000000000",
+                "0x5555555555555555555555555555555555555555",
+                "0xfFaa4a3D97fE9107Cef8a3F48c069F577Ff76cC1",
+                "0xfD739d4e423301CE9385c1fb8850539D657C296D",
+                "0x39694eFF3b02248929120c73F90347013Aec834d",
+                "0xbf747D2959F03332dbd25249dB6f00F62c6Cb526",
+                "0x442bCc0798D7a10f9C14C49477ac212f1E3a2732",
+                "0x5748ae796AE46A4F1348a1693de4b50560485562",
+                "0x96C6cBB6251Ee1c257b2162ca0f39AA5Fa44B1FB",
+                "0xca79db4B49f608eF54a5CB813FbEd3a6387bC645",
+                "0xB5fE77d323d69eB352A02006eA8ecC38D882620C",
+                "0x9FDBdA0A5e284c32744D2f17Ee5c74B284993463",
+                "0xBe6727B535545C67d5cAa73dEa54865B92CF7907",
+                "0x068f321Fa8Fb9f0D135f290Ef6a3e2813e1c8A29",
+                "0x27eC642013bcB3D80CA3706599D3cdA04F6f4452",
+                "0x3B4575E689DEd21CAAD31d64C4df1f10F3B2CedF",
+                "0xB8CE59FC3717ada4C02eaDF9682A9e934F625ebb",
+                "0x02c6a2fA58cC01A18B8D9E00eA48d65E4dF26c70",
+                "0x5d3a1Ff2b6BAb83b63cd9AD0787074081a52ef34",
+                "0xb50A96253aBDF803D85efcDce07Ad8becBc52BD5",
+                "0x5e105266db42f78FA814322Bce7f388B4C2e61eb",
+                "0x211Cc4DD073734dA055fbF44a2b4667d5E5fE5d2",
+                "0x1359b05241cA5076c9F59605214f4F84114c0dE8",
+                "0x9b498C3c8A0b8CD8BA1D9851d40D186F1872b44E",
+                "0x47bb061C0204Af921F43DC73C7D7768d2672DdEE",
+                "0x1bEe6762F0B522c606DC2Ffb106C0BB391b2E309",
+                "0x52e444545fbE9E5972a7A371299522f7871aec1F",
+                "0x11735dBd0B97CfA7Accf47d005673BA185f7fd49",
+                "0xB09158c8297ACee00b900Dc1f8715Df46B7246a6",
+                "0xdAbB040c428436d41CECd0Fb06bCFDBAaD3a9AA8",
+                "0xB6b636627bccec61f24d1d3EB430397774c304FC",
+                "0x7DCfFCb06B40344eecED2d1Cbf096B299fE4b405",
+                "0x7280CC1f369ab574c35cb8a8D0885e9486e3B733",
+                "0x6E0F6a71a74fAD5D0ED5A34b468203A4a4437b71",
+                "0xFE69bc93B936B34D371defa873686C116C8488c2",
+                "0xE6829d9a7eE3040e1276Fa75293Bde931859e8fA",
+                "0x00fDBc53719604D924226215bc871D55e40a1009",
+            ],
+        }
+
+        clt = cls.mk_clt("none")
+        url = "https://analytics-v3.valantis-analytics.xyz/usd_price"
+        rep = clt.post(
+            url,
+            json=dat,
+            headers={"authorization": "Bearer f2ffd7876ec03f1f4a04ed88402b1802"},
+        )
+        rep.raise_for_status()
+
+        res = rep.json()
+        return {x["address"].lower(): float(x["price"]) for x in res}
+
+
+class Hyperliquid:
+    @classmethod
+    def mk_clt(cls, addr: str):
+        hdr = {"origin": "https://app.hyperliquid.xyz", "referer": "https://app.hyperliquid.xyz/"}
+        return CltManager.create(addr, hdr)
+
+    @classmethod
+    def sign_terms(cls, acc: LocalAccount) -> bool:
+        clt = cls.mk_clt(acc.address)
+
+        # hl randomly can answer false
+        url = "https://api-ui.hyperliquid.xyz/info"
+        dat = {"type": "legalCheck", "user": str(acc.address)}
+        rep = clt.post(url, json=dat)
+        logger.debug(f"hl_legal_sign check: {rep.status_code} {rep.text}")
+        rep.raise_for_status()
+
+        dat = rep.json()
+        assert dat["ipAllowed"], "IP not allowed"
+        assert dat["userAllowed"], "User not allowed"
+        if dat["acceptedTerms"]:
+            return True
+
+        uts = int(time.time() * 1000)
+        dat = user_signed_payload(
+            "Hyperliquid:AcceptTerms",
+            [{"name": "hyperliquidChain", "type": "string"}, {"name": "time", "type": "uint64"}],
+            {
+                "hyperliquidChain": "Mainnet",
+                "time": uts,
+                "type": "acceptTerms",
+                "signatureChainId": "0x1",
+            },
+        )
+
+        sig = acc.sign_message(encode_typed_data(full_message=dat))
+        dat = {
+            "signature": {"r": f"0x{sig.r:064x}", "s": f"0x{sig.s:064x}", "v": sig.v},
+            "signatureChainId": "0x1",
+            "time": uts,
+            "type": "acceptTerms2",
+            "user": str(acc.address),
+        }
+
+        rep = clt.post(url, json=dat)
+        # debug_http(rep)
+        logger.debug(f"hl_legal_sign: {rep.status_code} {rep.text}")
+        rep.raise_for_status()
+        return True
