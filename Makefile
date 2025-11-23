@@ -1,4 +1,4 @@
-.PHONE: init
+.PHONY: init
 
 init:
 	git update-index --assume-unchanged _cex_map.txt

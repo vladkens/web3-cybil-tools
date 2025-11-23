@@ -15,10 +15,9 @@ from hyperliquid.exchange import Exchange
 from loguru import logger
 from web3 import Web3
 
-from delib import CltManager, Erc20, Erc4626, evm_call, to_addr
-from delib.cex import bybit_withdraw
-from delib.dex import Hyperliquid, HyperUnit, Hypurr, Valantis
-from delib.utils import cmd_say, load_cex_mapping
+from delib import CltManager, Erc20, Erc4626, cex, evm_call, to_addr
+from delib.dex import Harmonix, Hyperliquid, HyperUnit, Hypurr, SlippageError, Valantis
+from delib.utils import cmd_say, get_bw_wallets, load_cex_mapping
 
 
 class WrkCfg:
@@ -248,14 +247,6 @@ def hl_order(
 # MARK: Main
 
 
-def is_proxy_error(e: Exception) -> bool:
-    return (
-        isinstance(e, requests.exceptions.ProxyError)
-        or isinstance(e, httpx.ProxyError)
-        or isinstance(e, httpx.ReadTimeout)
-    )
-
-
 def floor_to_precision(value: float, precision: float) -> float:
     d_value = Decimal(str(value))
     d_precision = Decimal(str(precision))
@@ -386,7 +377,7 @@ class Worker:
         was_usdc = Erc20.balance_dec(self.w3_arb, ARB_USDC, self.acc.address)
         self.state.setitem("_usdc_before_cex_withdraw", was_usdc)
 
-        bybit_withdraw(chain="ARBI", coin="USDC", addr=self.acc.address, amount=amount)
+        cex.bybit_withdraw(chain="ARBI", coin="USDC", addr=self.acc.address, amount=amount)
         logger.info(f"CEX withdraw requested: {amount} USDC to {self.acc.address}")
 
     def act_cex_withdraw_usdc_wait(self):
@@ -526,7 +517,7 @@ class Worker:
         self.state.setitem("vault_felix", v1_bal)
         self.state.setitem("vault_sentiment", v2_bal)
         self.state.setitem("swap_hypurr", swap1_bal)
-        self.state.setitem("swap_valantis", swap2_bal)
+        self.state.setitem("swap_harmonix", swap2_bal)
 
     def act_supply_felix(self):
         dep = self.state.getorfail("vault_felix")
@@ -545,10 +536,10 @@ class Worker:
         dep = _to_wei_erc(self.w3_hle, self.acc, HL_EVM_USDE, dep)
         Hypurr.swap(self.w3_hle, self.acc, HL_EVM_USDE, HL_EVM_USDT, dep)
 
-    def act_swap_usde2usdt_valantis(self):
-        dep = self.state.getorfail("swap_valantis")
+    def act_swap_usde2usdt_harmonix(self):
+        dep = self.state.getorfail("swap_harmonix")
         dep = _to_wei_erc(self.w3_hle, self.acc, HL_EVM_USDE, dep)
-        Valantis.swap(self.w3_hle, self.acc, HL_EVM_USDE, HL_EVM_USDT, dep)
+        Harmonix.swap(self.w3_hle, self.acc, HL_EVM_USDE, HL_EVM_USDT, dep)
 
     def act_hypurr_supply_usdt(self):
         bal = Erc20.balance(self.w3_hle, HL_EVM_USDT, self.acc.address)
@@ -607,10 +598,9 @@ class Worker:
         logger.debug(f"Swapping USDT to USDE via Hypurr: {dep} (all {bal})")
         Hypurr.swap(self.w3_hle, self.acc, HL_EVM_USDT, HL_EVM_USDE, dep)
 
-    def act_swap_usdt2usde_valantis(self):
+    def act_swap_usdt2usde_harmonix(self):
         bal = Erc20.balance(self.w3_hle, HL_EVM_USDT, self.acc.address)
-        logger.debug(f"Swapping USDT to USDE via Valantis: {bal}")
-        Valantis.swap(self.w3_hle, self.acc, HL_EVM_USDT, HL_EVM_USDE, bal)
+        Harmonix.swap(self.w3_hle, self.acc, HL_EVM_USDT, HL_EVM_USDE, bal)
 
     def act_redeem_felix(self):
         bal = Erc20.balance(self.w3_hle, HL_FELIX_USDE, self.acc.address)
@@ -706,11 +696,20 @@ class Worker:
         cmd_say("Hyperliquid worker done!", repeat=1)
 
     def act_pause_flow(self):
-        raise NotImplementedError()
+        msg = "Paused for manual intervention. Set 'act_done' to True in state file to continue."
+        logger.warning(msg)
+        exit(1)
 
     def _exec_fn(self, fn):
         act_name = fn.__name__
         now_retries, max_retries = 0, WrkCfg.max_retries
+
+        safe_errors = [
+            requests.exceptions.ProxyError,
+            httpx.ProxyError,
+            httpx.ReadTimeout,
+            SlippageError,
+        ]
 
         known_patterns = [
             (RuntimeError, "tx failed:"),
@@ -727,9 +726,11 @@ class Worker:
             except Exception as e:
                 logger.error(f"Worker: failed '{act_name}' {type(e)}: {e}")
 
-                # always retry on proxy errors
-                if is_proxy_error(e):
-                    time.sleep(2.0)
+                is_safe = any(isinstance(e, x) for x in safe_errors)
+                if is_safe:
+                    wait_sec = random.uniform(2.0, 8.0)
+                    logger.info(f"Worker: safe error, retrying '{act_name}' in {wait_sec:.2f}s")
+                    time.sleep(wait_sec)
                     continue
 
                 err_txt = str(e).lower()
@@ -738,14 +739,14 @@ class Worker:
 
                 # fail fast on unknown errors
                 max_retries = max_retries if not fast_exit else 0
-                rnd_sec = random.uniform(10, 30)
+                wait_sec = random.uniform(10, 30)
                 rmsg = f"retry {now_retries}/{max_retries}, {known_err=}"
-                logger.info(f"Worker: retrying '{act_name}' in {rnd_sec:.2f} sec ({rmsg})")
+                logger.info(f"Worker: retrying '{act_name}' in {wait_sec:.2f}s ({rmsg})")
 
                 if now_retries >= max_retries:
                     break
 
-                time.sleep(rnd_sec)
+                time.sleep(wait_sec)
                 continue
 
         logger.error(f"Worker: failed '{act_name}' after {now_retries} retries, exiting")
@@ -782,7 +783,7 @@ class Worker:
             self.state.setitem("act_done", True)
 
             rnd_sleep = self.rnd.uniform(5.0, 10.0)
-            logger.info(f"Worker: sleeping for {rnd_sleep:.2f} sec before next action")
+            logger.info(f"Worker: sleeping for {rnd_sleep:.2f}s before next action")
             time.sleep(rnd_sleep)
 
     def route1(self):
@@ -801,7 +802,7 @@ class Worker:
             self.act_supply_felix,
             self.act_supply_sentiment,
             self.act_swap_usde2usdt_hypurr,
-            self.act_swap_usde2usdt_valantis,
+            self.act_swap_usde2usdt_harmonix,
             self.act_hypurr_supply_usdt,
             self.act_hypurr_borrow_ueth,
             # self.act_pause_flow, # todo: something better then out / in
@@ -815,7 +816,7 @@ class Worker:
             self.act_hypurr_redeem_usdt,
             self.act_swap_ueth2usdt_hypurr,
             self.act_swap_usdt2usde_hypurr,
-            self.act_swap_usdt2usde_valantis,
+            self.act_swap_usdt2usde_harmonix,
             self.act_redeem_felix,
             self.act_redeem_sentiment,
             self.act_hl_usde_from_evm,

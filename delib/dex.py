@@ -10,7 +10,12 @@ from loguru import logger
 from .evm import Erc20, LocalAccount, Web3, evm_call, to_addr
 from .utils import CltManager
 
+DEFAULT_SLIPPAGE = 0.0075  # 0.75%
 HYPURR_FI = "0xceCcE0EB9DD2Ef7996e01e25DD70e461F918A14b"
+
+
+class SlippageError(Exception):
+    pass
 
 
 # https://app.hyperunit.xyz/
@@ -37,21 +42,21 @@ class HyperUnit:
 
         logger.debug(f"sign_hyperunit: {rep.status_code} {rep.text}")
         rep.raise_for_status()
-        dat = rep.json()
+        res = rep.json()
 
         cat = datetime.now(tz=UTC).isoformat(timespec="milliseconds")
         cat = cat.replace("+00:00", "Z")
 
         txt = f"""
         app.hyperunit.xyz wants you to sign in with your Ethereum account:
-        {dat["address"]}
+        {res["address"]}
 
         By signing, you are proving you own this wallet and logging in. This does not initiate a transaction or cost any fees.
 
         URI: https://app.hyperunit.xyz
         Version: 1
         Chain ID: 1
-        Nonce: {dat["nonce"]}
+        Nonce: {res["nonce"]}
         Issued At: {cat}
         Resources:
         - https://privy.io
@@ -77,13 +82,13 @@ class HyperUnit:
         logger.debug(f"sign_hyperunit auth: {rep.status_code} {rep.text}")
         rep.raise_for_status()
 
-        dat = rep.json()
-        if dat["user"]["has_accepted_terms"]:
+        res = rep.json()
+        if res["user"]["has_accepted_terms"]:
             return True
 
         rep = clt.post(
             "https://auth.privy.io/api/v1/users/me/accept_terms",
-            headers={**hdr, "authorization": f"Bearer {dat['token']}"},
+            headers={**hdr, "authorization": f"Bearer {res['token']}"},
             json={},
         )
 
@@ -103,9 +108,9 @@ class HyperUnit:
         rep = clt.get(f"https://api.hyperunit.xyz/gen/{fchain}/{tchain}/{asset}/{acc.address}")
         rep.raise_for_status()
 
-        dat = rep.json()
-        assert dat["status"] == "OK", f"Unit deposit address fetch failed: {dat}"
-        dep_addr = to_addr(Web3(), dat["address"])
+        res = rep.json()
+        assert res["status"] == "OK", f"Unit deposit address fetch failed: {res}"
+        dep_addr = to_addr(Web3(), res["address"])
         return str(dep_addr)
 
     @classmethod
@@ -155,7 +160,7 @@ class HyperUnit:
             "time": uts,
         }
 
-        dat = user_signed_payload(
+        pld = user_signed_payload(
             "HyperliquidTransaction:SpotSend",
             [
                 {"name": "hyperliquidChain", "type": "string"},
@@ -167,14 +172,14 @@ class HyperUnit:
             msg,
         )
 
-        sig = acc.sign_message(encode_typed_data(full_message=dat))
-        dat = {
+        sig = acc.sign_message(encode_typed_data(full_message=pld))
+        pld = {
             "action": {"type": "spotSend", **msg},
             "nonce": uts,
             "signature": {"r": f"0x{sig.r:064x}", "s": f"0x{sig.s:064x}", "v": sig.v},
         }
 
-        rep = clt.post("https://api.hyperliquid.xyz/exchange", json=dat)
+        rep = clt.post("https://api.hyperliquid.xyz/exchange", json=pld)
         rep.raise_for_status()
 
         res = rep.json()
@@ -306,21 +311,14 @@ class Hypurr:
         return rs
 
     @classmethod
-    def swap(
-        cls,
-        w3: Web3,
-        ac: LocalAccount,
-        src_token: str,
-        dst_token: str,
-        amount: int,
-    ):
+    def swap(cls, w3: Web3, ac: LocalAccount, src_token: str, dst_token: str, amount: int):
         src_token = to_addr(w3, src_token)
         dst_token = to_addr(w3, dst_token)
 
-        dat = {
+        pld = {
             "inputToken": str(src_token),
             "outputToken": str(dst_token),
-            "inputAmount": amount,
+            "inputAmount": str(amount),
             "userAddress": str(ac.address),
             "outputReceiver": str(ac.address),
             "chainID": "hyperevm",
@@ -339,23 +337,30 @@ class Hypurr:
                 "origin": "https://app.hypurr.fi",
                 "referer": "https://app.hypurr.fi/swap",
             },
-            json=dat,
+            json=pld,
         )
 
         # logger.debug(f"gluex_swap: {rep.status_code} {rep.text}")
         rep.raise_for_status()
 
-        dat = rep.json()
-        assert "statusCode" in dat and "result" in dat, f"GlueX swap quote failed: {dat}"
-        assert dat["statusCode"] == 200, f"GlueX swap quote failed: {dat}"
-        dat = dat["result"]
+        res = rep.json()
+        assert "statusCode" in res and "result" in res, f"GlueX swap quote failed: {res}"
+        assert res["statusCode"] == 200, f"GlueX swap quote failed: {res}"
+        res = res["result"]
 
-        Erc20.check_approve(w3, ac, src_token, dat["router"], int(dat["inputAmount"]))
+        amount1 = float(res["inputAmountUSD"])
+        amount2 = float(res["outputAmountUSD"])
+        price_impact = 1 - (amount2 / amount1)
+        logger.debug(f"price impact: {price_impact:.3%} ({amount1:.3f} -> {amount2:.3f} in USD)")
+        if price_impact > DEFAULT_SLIPPAGE:
+            raise SlippageError(f"Price impact too high: {price_impact:.3%}")
+
+        Erc20.check_approve(w3, ac, src_token, res["router"], int(res["inputAmount"]))
 
         params = {
-            "to": to_addr(w3, dat["router"]),
-            "data": dat["calldata"],
-            "gas": int(dat["computationUnits"]),
+            "to": to_addr(w3, res["router"]),
+            "data": res["calldata"],
+            "gas": int(res["computationUnits"]),
         }
 
         return evm_call(w3, ac, params)
@@ -370,10 +375,12 @@ class Valantis:
 
     @classmethod
     def swap(cls, w3: Web3, ac: LocalAccount, src_token: str, dst_token: str, amount: int):
+        raise NotImplementedError("Valantis changed API, use different DEX for now")
+
         src_token = to_addr(w3, src_token)
         dst_token = to_addr(w3, dst_token)
 
-        dat = {
+        pld = {
             "inputToken": str(src_token),
             "outputToken": str(dst_token),
             "inputAmount": str(amount),
@@ -387,18 +394,22 @@ class Valantis:
         rep = clt.post(
             "https://analytics-v3.valantis-analytics.xyz/gluex_quote_with_surplus",
             headers={"authorization": "Bearer f2ffd7876ec03f1f4a04ed88402b1802"},
-            json=dat,
+            json=pld,
         )
         rep.raise_for_status()
 
         res = rep.json()
         assert "statusCode" in res and "result" in res, f"GlueX swap quote failed: {res}"
         assert res["statusCode"] == 200, f"GlueX swap quote failed: {res}"
+        logger.debug(f"valantis_swap: {json.dumps(res)}")
         res = res["result"]
 
-        assert "calldata" in res and "router" in res, (
-            f"GlueX swap data missing:\n{json.dumps(dat)}\n{json.dumps(res)}"
-        )
+        assert "calldata" in res and "router" in res, f"Valantis swap quote failed: {res}"
+
+        # for example: "0.000443%"
+        price_impact = float(res["averagePriceImpact"].replace("%", "")) / 100.0
+        if price_impact > DEFAULT_SLIPPAGE:
+            raise SlippageError(f"Price impact too high: {price_impact:.3%}")
 
         Erc20.check_approve(w3, ac, src_token, res["router"], int(res["inputAmount"]))
 
@@ -412,7 +423,7 @@ class Valantis:
 
     @classmethod
     def prices(cls):
-        dat = {
+        pld = {
             "chainId": 999,
             "addresses": [
                 "0x0000000000000000000000000000000000000000",
@@ -459,13 +470,80 @@ class Valantis:
         url = "https://analytics-v3.valantis-analytics.xyz/usd_price"
         rep = clt.post(
             url,
-            json=dat,
+            json=pld,
             headers={"authorization": "Bearer f2ffd7876ec03f1f4a04ed88402b1802"},
         )
         rep.raise_for_status()
 
         res = rep.json()
         return {x["address"].lower(): float(x["price"]) for x in res}
+
+
+class Harmonix:
+    @classmethod
+    def mk_clt(cls, addr: str):
+        hdr = {
+            "origin": "https://app.harmonix.fi",
+            "referer": "https://app.harmonix.fi/",
+            "x-client-id": "harmonix",
+        }
+        return CltManager.create(addr, hdr)
+
+    @classmethod
+    def swap(cls, w3: Web3, ac: LocalAccount, src_token: str, dst_token: str, amount: int):
+        clt = cls.mk_clt(ac.address)
+        amount = int(amount)  # as native integer (dec * decimals)
+
+        rep = clt.get(
+            "https://aggregator-api.kyberswap.com/hyperevm/api/v1/routes",
+            params={
+                "tokenIn": src_token,
+                "tokenOut": dst_token,
+                "saveGas": False,
+                "gasInclude": True,
+                "amountIn": amount,
+                "chargeFeeBy": "currency_in",
+                "feeAmount": 1,
+                "isInBps": True,
+                "feeReceiver": "0x51e282383df1f745fe6fd4d26ccb0b62d337813b",
+            },
+        )
+
+        rep.raise_for_status()
+        res = rep.json()
+        assert "code" in res and "data" in res, f"Harmonix swap quote failed: {res}"
+        assert res["code"] == 0, f"Harmonix swap error code: {res}"
+        res = res["data"]
+
+        amount1 = float(res["routeSummary"]["amountInUsd"])
+        amount2 = float(res["routeSummary"]["amountOutUsd"])
+        price_impact = 1 - (amount2 / amount1)
+        logger.debug(f"price impact: {price_impact:.3%} ({amount1:.3f} -> {amount2:.3f} in USD)")
+        if price_impact > DEFAULT_SLIPPAGE:
+            raise SlippageError(f"Price impact too high: {price_impact:.3%}")
+
+        Erc20.check_approve(w3, ac, src_token, res["routerAddress"], amount)
+
+        rep = clt.post(
+            "https://aggregator-api.kyberswap.com/hyperevm/api/v1/route/build",
+            json={
+                "deadline": int(time.time()),
+                "recipient": ac.address,
+                "sender": ac.address,
+                "slippageTolerance": int(DEFAULT_SLIPPAGE * 1000),
+                "source": "harmonix",
+                "routeSummary": res["routeSummary"],
+            },
+        )
+
+        rep.raise_for_status()
+        res = rep.json()
+        assert "code" in res and "data" in res, f"Harmonix swap quote failed: {res}"
+        assert res["code"] == 0, f"Harmonix swap error code: {res}"
+        res = res["data"]
+
+        params = {"to": res["routerAddress"], "data": res["data"], "gas": int(res["gas"])}
+        return evm_call(w3, ac, params)
 
 
 class Hyperliquid:
@@ -480,19 +558,18 @@ class Hyperliquid:
 
         # hl randomly can answer false
         url = "https://api-ui.hyperliquid.xyz/info"
-        dat = {"type": "legalCheck", "user": str(acc.address)}
-        rep = clt.post(url, json=dat)
+        rep = clt.post(url, json={"type": "legalCheck", "user": str(acc.address)})
         logger.debug(f"hl_legal_sign check: {rep.status_code} {rep.text}")
         rep.raise_for_status()
 
-        dat = rep.json()
-        assert dat["ipAllowed"], "IP not allowed"
-        assert dat["userAllowed"], "User not allowed"
-        if dat["acceptedTerms"]:
+        res = rep.json()
+        assert res["ipAllowed"], "IP not allowed"
+        assert res["userAllowed"], "User not allowed"
+        if res["acceptedTerms"]:
             return True
 
         uts = int(time.time() * 1000)
-        dat = user_signed_payload(
+        pld = user_signed_payload(
             "Hyperliquid:AcceptTerms",
             [{"name": "hyperliquidChain", "type": "string"}, {"name": "time", "type": "uint64"}],
             {
@@ -503,8 +580,8 @@ class Hyperliquid:
             },
         )
 
-        sig = acc.sign_message(encode_typed_data(full_message=dat))
-        dat = {
+        sig = acc.sign_message(encode_typed_data(full_message=pld))
+        pld = {
             "signature": {"r": f"0x{sig.r:064x}", "s": f"0x{sig.s:064x}", "v": sig.v},
             "signatureChainId": "0x1",
             "time": uts,
@@ -512,7 +589,7 @@ class Hyperliquid:
             "user": str(acc.address),
         }
 
-        rep = clt.post(url, json=dat)
+        rep = clt.post(url, json=pld)
         # debug_http(rep)
         logger.debug(f"hl_legal_sign: {rep.status_code} {rep.text}")
         rep.raise_for_status()
