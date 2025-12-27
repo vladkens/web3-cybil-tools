@@ -17,8 +17,7 @@ def to_addr(w3: Web3, addr: str | int):
     return w3.to_checksum_address(addr)
 
 
-def _dynamic_fee_params(w3: Web3) -> dict:
-    latest = w3.eth.get_block("latest")
+def _dynamic_fee_params(w3: Web3, latest) -> dict:
     base_fee = latest.get("baseFeePerGas")
 
     if base_fee is None:
@@ -59,10 +58,14 @@ def _evm_log_tx(w3: Web3, txid: str, params: TxParams):
 
 
 def _evm_call_internal(w3: Web3, ac: LocalAccount, params: TxParams, wait_timeout: int) -> str:
+    logger.debug(f"tx params1: {_evm_dump_params(params)}")
+
+    latest = w3.eth.get_block("latest")
+    gas_limit = int(latest.get("gasLimit", 30_000_000))
     params["chainId"] = w3.eth.chain_id
     params["nonce"] = w3.eth.get_transaction_count(ac.address)
     params["from"] = ac.address
-    params.update(_dynamic_fee_params(w3))
+    params.update(_dynamic_fee_params(w3, latest))
 
     try:
         # gas can be passed in params directly or try to estimate it
@@ -73,8 +76,9 @@ def _evm_call_internal(w3: Web3, ac: LocalAccount, params: TxParams, wait_timeou
     assert "gas" in params, "Gas not set in tx params"
     assert params["gas"] >= 21000, f"Gas too low in tx params: {params['gas']}"
     params["gas"] = int(params["gas"] * 1.2)  # safety buffer
+    params["gas"] = min(params["gas"], gas_limit)  # max gas limit
 
-    logger.debug(f"_evm_send: {_evm_dump_params(params)}")
+    logger.debug(f"tx params2: {_evm_dump_params(params)}")
     # exit(1)
 
     signed = ac.sign_transaction(params)
@@ -115,7 +119,10 @@ def evm_call(
         try:
             return _evm_call_internal(w3, ac, pld, wait_timeout=wait_timeout)
         except web3.exceptions.Web3RPCError as e:
-            can_retry = now_retries < max_retries
+            emsg = str(e).lower()
+            fail_fast = "exceeds block gas limit" in emsg
+
+            can_retry = now_retries < max_retries and not fail_fast
             rnd_sec = random.uniform(3.0, 6.0)
 
             rmsg = (
@@ -124,7 +131,9 @@ def evm_call(
                 else "no more retries left."
             )
 
+            rmsg = rmsg + " (fail fast)" if fail_fast else rmsg
             logger.warning(f"RPC err {type(e)} – {rmsg}; {e}")
+
             if not can_retry:
                 raise e
 
@@ -235,6 +244,8 @@ class Erc20:
 
     @classmethod
     def check_approve(cls, w3: Web3, ac: LocalAccount, caddr: str, spender: str, amount: int):
+        amount = 2**256 - 1 if amount == -1 else amount
+        assert amount >= 0, "Amount must be non-negative"
         caddr = to_addr(w3, caddr)
 
         allowance = cls.allowance(w3, caddr, ac.address, spender)

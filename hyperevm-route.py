@@ -5,6 +5,7 @@ import time
 from datetime import UTC, datetime
 from decimal import ROUND_DOWN, Decimal
 from functools import lru_cache
+from typing import Callable
 
 import httpx
 import requests
@@ -15,7 +16,7 @@ from hyperliquid.exchange import Exchange
 from loguru import logger
 from web3 import Web3
 
-from delib import CltManager, Erc20, Erc4626, cex, evm_call, to_addr
+from delib import CltManager, Erc20, Erc4626, cex, dex, evm_call, to_addr
 from delib.dex import Harmonix, Hyperliquid, HyperUnit, Hypurr, SlippageError, Valantis
 from delib.utils import cmd_say, get_bw_wallets, load_cex_mapping
 
@@ -31,6 +32,7 @@ class WrkCfg:
 ETH_RPC_URL = "https://1rpc.io/eth"
 HLE_RPC_URL = "https://rpc.hyperliquid.xyz/evm"
 ARB_RPC_URL = "https://arb1.arbitrum.io/rpc"
+BSE_RPC_URL = "https://mainnet.base.org"
 
 HL_API_URL = "https://api.hyperliquid.xyz"
 HL_BRIDGE_ADDR = "0x2df1c51e09aecf9cacb7bc98cb1742757f163df7"
@@ -46,11 +48,15 @@ HL_DEX_UETH = "UETH:0xe1edd30daaf5caac3fe63569e24748da"
 HL_EVM_USDE = "0x5d3a1ff2b6bab83b63cd9ad0787074081a52ef34"
 HL_EVM_USDT = "0xb8ce59fc3717ada4c02eadf9682a9e934f625ebb"
 HL_EVM_UETH = "0xbe6727b535545c67d5caa73dea54865b92cf7907"
+HL_EVM_USDHL = "0xb50A96253aBDF803D85efcDce07Ad8becBc52BD5"
 
 # https://hyperevmscan.io/address/0x8ebA6fc4Ff6Ba4F12512DD56d0E4aaC6081f5274#readContract
 # getReservesIncentivesData: a73ff12d177d8f1ec938c3ba0e87d33524dd5594
 # abi: https://raw.githubusercontent.com/0xVanfer/abigen/main/aave/aaveUiIncentiveDataProviderV3/aaveUiIncentiveDataProviderV3.go
+
+# search address in hypurr supply transaction
 HL_EVM_HYUSDT = "0x1Ca7e21B2dAa5Ab2eB9de7cf8f34dCf9c8683007"
+HL_EVM_HYUETH = "0x68717797aAAe1b009C258b6fF5403AeCCB7010c0"
 
 # https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/hyperevm/hypercore-less-than-greater-than-hyperevm-transfers
 HL_SWAPS = {
@@ -332,6 +338,7 @@ class Worker:
         self.w3_arb = Web3(Web3.HTTPProvider(ARB_RPC_URL, request_kwargs=w3_kw))
         self.w3_hle = Web3(Web3.HTTPProvider(HLE_RPC_URL, request_kwargs=w3_kw))
         self.w3_eth = Web3(Web3.HTTPProvider(ETH_RPC_URL, request_kwargs=w3_kw))
+        self.w3_bse = Web3(Web3.HTTPProvider(BSE_RPC_URL, request_kwargs=w3_kw))
         self.hl = Exchange(wallet=self.acc, base_url=HL_API_URL)  # todo: proxy
         self.hl.session.proxies = w3_kw["proxies"] if w3_kw else None
 
@@ -353,7 +360,7 @@ class Worker:
         # raise NotImplementedError()
 
     def act_cex_withdraw_usdc(self):
-        # todo: unfinished action
+        # todo: unfinished action (only one CEX supported)
         if WrkCfg.cex_withdraw is False:
             logger.info("CEX withdraw disabled in config")
             return
@@ -370,9 +377,7 @@ class Worker:
         logger.debug(f"Min CEX withdraw amount calculated: {min_dep:.4f} USDC")
 
         amount = WrkCfg.cex_withdraw_amount
-        if amount < min_dep:
-            logger.error(f"CEX withdraw amount too low: {amount} < {min_dep}")
-            exit(1)
+        assert amount > min_dep, f"CEX withdraw amount too low: {amount} < {min_dep}"
 
         was_usdc = Erc20.balance_dec(self.w3_arb, ARB_USDC, self.acc.address)
         self.state.setitem("_usdc_before_cex_withdraw", was_usdc)
@@ -395,6 +400,32 @@ class Worker:
                 break
 
             logger.info(f"Waiting for CEX withdraw... current USDC balance: {now_usdc:.2f}")
+
+    def act_cex_withdraw_eth(self):
+        if WrkCfg.cex_withdraw is False:
+            return
+
+        withdrawable = cex.bybit_wait_deposit("ETH", wait_sec=60 * 3)
+        withdrawable = floor_to_precision(withdrawable * 0.99, 0.0001)
+        logger.debug(f"{self.acc.address} ~ {withdrawable} ETH")
+        assert withdrawable >= 0.05, f"Not enough withdrawable from CEX: {withdrawable} ETH"
+
+        was_eth = self.w3_arb.eth.get_balance(self.acc.address)
+        self.state.setitem("_eth_before_cex_withdraw", was_eth / 1e18)
+
+        cex.bybit_withdraw(chain="ARBI", coin="ETH", addr=self.acc.address, amount=withdrawable)
+
+    def act_cex_withdraw_eth_wait(self):
+        was_eth = self.state.getorfail("_eth_before_cex_withdraw")
+        while True:
+            now_eth = self.w3_arb.eth.get_balance(self.acc.address) / 1e18
+            if now_eth > was_eth:
+                logger.info(f"CEX withdraw completed: new ETH balance {now_eth:.6f}")
+                self.state.delitem("_eth_before_cex_withdraw")
+                break
+
+            logger.info(f"Waiting for CEX withdraw... current ETH balance: {now_eth:.6f}")
+            time.sleep(15)
 
     def act_hl_deposit(self):
         arb_eth = self.w3_arb.eth.get_balance(self.acc.address) / 1e18
@@ -477,15 +508,13 @@ class Worker:
     def act_unit_dep_eth(self):
         eth_bal = self.w3_eth.eth.get_balance(self.acc.address)
         eth_dep = eth_bal - int(0.003 * 1e18)  # keep some founds on wallet ~ 6-8 USD
-        eth_dep = int(eth_dep / 1e14 * 1e14)  # floor to 0.0001 ETH precision
+        eth_dep = round(eth_dep / 1e14) * int(1e14)  # floor to 0.0001 ETH precision
 
         bal_dec = eth_bal / 1e18
         dep_dec = eth_dep / 1e18
         left_dec = (eth_bal - eth_dep) / 1e18
         logger.debug(f"ETH now: {bal_dec:.6f}, dep: {dep_dec:.6f}, left: {left_dec:.6f}")
-        if dep_dec < 0.05:
-            logger.error(f"Not enough balance for Unit deposit: {dep_dec} ETH. Skipping.")
-            exit(1)
+        assert dep_dec > 0.05, f"Not enough ETH to deposit: {dep_dec} ETH"
 
         dep_addr = HyperUnit.get_dep_addr(self.acc, "ethereum", "hyperliquid", "eth")
         logger.debug(f"Unit ETH deposit address: {dep_addr}")
@@ -555,7 +584,7 @@ class Worker:
         max_rate = dat["availableBorrows"] / dat["totalCollateral"]
         safe_rate = self.rnd.uniform(0.5, max_rate * 0.85)
         safe_bal = all_bal * safe_rate
-        logger.info(f"Borrow rates {max_rate=:.2%}% {safe_rate=:.2%}%")
+        logger.info(f"Borrow rates {max_rate=:.2%} {safe_rate=:.2%}")
         logger.info(f"Borrow collateral {all_bal=:.2f} {can_bal=:.2f} {safe_bal=:.2f}")
 
         prices = Valantis.prices()
@@ -657,9 +686,7 @@ class Worker:
 
         hl_bal = hl_token_bal(self.hl, "UETH")
         logger.debug(f"HL UETH balance on Core: {hl_bal}, withdrawing to Unit")
-        if hl_bal < 0.05:
-            logger.error(f"Not enough HL UETH balance to withdraw: {hl_bal}")
-            exit(1)
+        assert hl_bal > 0.05, f"No UETH balance in HL Core account: {hl_bal}"
 
         expect_ops = len(HyperUnit.get_ops(self.acc)) + 1
         HyperUnit.widthdraw(self.acc, HL_DEX_UETH, hl_bal)
@@ -670,7 +697,7 @@ class Worker:
         HyperUnit.wait_ongoing_ops(self.acc, expect_ops)
         self.state.delitem("unit_expect_ops")
 
-    def act_final(self):
+    def act_finalize(self):
         if "_usdc_before" in self.state:
             was_bal = self.state.getorfail("_usdc_before")
             now_bal = Erc20.balance_dec(self.w3_arb, ARB_USDC, self.acc.address)
@@ -693,12 +720,21 @@ class Worker:
             )
 
         logger.info(f"Worker: done, cost = {cost:.2f} USDC")
-        cmd_say("Hyperliquid worker done!", repeat=1)
 
-    def act_pause_flow(self):
+    def act_sleep(self):
+        min_min, max_min = 1, 2
+        wait_sec = self.rnd.uniform(float(min_min * 60), float(max_min * 60))
+        logger.info(f"Worker: sleeping for {wait_sec:.2f}s")
+        time.sleep(wait_sec)
+
+    def act_pause(self):
         msg = "Paused for manual intervention. Set 'act_done' to True in state file to continue."
         logger.warning(msg)
         exit(1)
+
+    def act_final(self):
+        # final no-op action for state machine
+        cmd_say("Hyperliquid worker done!", repeat=1)
 
     def _exec_fn(self, fn):
         act_name = fn.__name__
@@ -719,7 +755,9 @@ class Worker:
         ]
 
         while True:
+            print("-" * 60)
             now_retries += 1
+
             try:
                 logger.info(f"Worker: executing action '{act_name}'")
                 return fn()
@@ -752,12 +790,17 @@ class Worker:
         logger.error(f"Worker: failed '{act_name}' after {now_retries} retries, exiting")
         exit(1)
 
-    def run(self):
-        routes, mapping = self.route1(), {}
+    def run(self, routes_fn: Callable[..., list[Callable[..., None]]]):
+        routes, mapping = routes_fn(), {}
         for i in range(len(routes)):
             fn = routes[i]
             next_fn = routes[i + 1] if i + 1 < len(routes) else None
             mapping[fn.__name__] = {"func": fn, "next": next_fn.__name__ if next_fn else None}
+
+        was_route = self.state.getitem("_route") or routes_fn.__name__
+        now_route = routes_fn.__name__
+        assert was_route == now_route, f"Route changed: {was_route} -> {now_route}"
+        self.state.setitem("_route", now_route)
 
         while True:
             act_name = self.state.getitem("act_name") or routes[0].__name__
@@ -778,7 +821,6 @@ class Worker:
                 self.state.setitem("act_done", False)
                 continue
 
-            print("-" * 60)
             self._exec_fn(act["func"])
             self.state.setitem("act_done", True)
 
@@ -805,7 +847,7 @@ class Worker:
             self.act_swap_usde2usdt_harmonix,
             self.act_hypurr_supply_usdt,
             self.act_hypurr_borrow_ueth,
-            # self.act_pause_flow, # todo: something better then out / in
+            # todo: something better then out / in
             self.act_unit_withdraw_ueth,
             self.act_unit_withdraw_ueth_wait,
             self.act_unit_dep_eth,
@@ -824,23 +866,250 @@ class Worker:
             self.act_hl_spot2perp_usdc,
             self.act_hl_withdraw,
             self.act_hl_withdraw_wait,
+            self.act_finalize,
             self.act_final,
         ]
 
+    def act_bridge_arb2eth_eth(self):
+        was_eth = self.w3_eth.eth.get_balance(self.acc.address)
+        self.state.setitem("_eth_before_bridge", was_eth)
+
+        raw_bal = self.w3_arb.eth.get_balance(self.acc.address)
+        dep_bal = raw_bal - int(0.003 * 1e18)  # keep some ETH for fees
+        dep_bal = round(dep_bal / 1e14) * int(1e14)  # floor to 0.0001 ETH precision
+
+        bal_move = dep_bal / 1e18
+        bal_left = (raw_bal - dep_bal) / 1e18
+        logger.debug(f"Bridging ETH from ARB to ETH: {bal_move:.6f} ~ {bal_left:.6f} left")
+        dex.Jumper.bridge(self.w3_arb, self.acc, "ARB", "ETH", "ETH", dep_bal)
+
+    def act_bridge_arb2eth_eth_wait(self):
+        was_eth = self.state.getorfail("_eth_before_bridge")
+        while True:
+            now_eth = self.w3_eth.eth.get_balance(self.acc.address)
+            if now_eth > was_eth:
+                logger.info(f"Bridge completed: new ETH balance {now_eth / 1e18:.6f}")
+                self.state.delitem("_eth_before_bridge")
+                break
+
+            logger.info(f"Waiting for bridge... current ETH balance: {now_eth / 1e18:.6f}")
+            time.sleep(15)
+
+    def act_bridge_hle2base_eth(self):
+        was_eth = self.w3_bse.eth.get_balance(self.acc.address)
+        self.state.setitem("_eth_before_bridge", was_eth)
+
+        dep_bal = Erc20.balance(self.w3_hle, HL_EVM_UETH, self.acc.address)  # erc20 token
+        dep_bal = dep_bal - int(0.0005 * 1e18)  # keep some eth with NO reasons to avoid FAILURE
+
+        logger.debug(f"Bridging UETH from HL EVM to Base: {dep_bal}")
+        dex.Jumper.bridge(self.w3_hle, self.acc, "HLE", "BASE", "ETH", dep_bal)
+
+    def act_bridge_hle2base_eth_wait(self):
+        was_eth = self.state.getorfail("_eth_before_bridge")
+        while True:
+            now_eth = self.w3_bse.eth.get_balance(self.acc.address)
+            if now_eth > was_eth:
+                logger.info(f"Bridge completed: new ETH balance {now_eth / 1e18:.6f}")
+                self.state.delitem("_eth_before_bridge")
+                break
+
+            logger.info(f"Waiting for bridge... current ETH balance: {now_eth / 1e18:.6f}")
+            time.sleep(15)
+
+    def act_swap_ueth2usdhl_fees(self):
+        # get small amount of USDHL for fees too repay later
+        gap = int(0.003 * 1e18)
+        bal = Erc20.balance(self.w3_hle, HL_EVM_UETH, self.acc.address)
+        assert bal > gap, f"Not enough UETH balance to swap small USDHL: {bal} <= {gap}"
+
+        logger.debug(f"Swapping small UETH to USDHL via Harmonix: {gap}")
+        Harmonix.swap(self.w3_hle, self.acc, HL_EVM_UETH, HL_EVM_USDHL, gap)
+
+    def act_swap_usdhl2ueth_all(self):
+        bal = Erc20.balance(self.w3_hle, HL_EVM_USDHL, self.acc.address)
+        logger.debug(f"Swapping all USDHL to UETH via Harmonix: {bal}")
+        Harmonix.swap(self.w3_hle, self.acc, HL_EVM_USDHL, HL_EVM_UETH, bal)
+
+    def act_hypurr_supply_ueth(self):
+        bal = Erc20.balance(self.w3_hle, HL_EVM_UETH, self.acc.address)
+        bal = int(bal * 0.985)  # supply 98.5% of balance
+        Hypurr.supply(self.w3_hle, self.acc, HL_EVM_UETH, bal)
+
+    def act_hypurr_borrow_usdhl(self):
+        ltv_rate = self.rnd.uniform(0.75, 0.85)
+        safe_bal = Hypurr.get_safe_bal(self.w3_hle, self.acc, ltv_rate)
+
+        prices = Valantis.prices()
+        price = prices.get(HL_EVM_USDHL.lower())
+        assert price is not None, "HL_EVM_USDHL price not found"
+
+        safe_amount = floor_to_precision(safe_bal / price, 0.1)
+        safe_amount_wei = _to_wei_erc(self.w3_hle, self.acc, HL_EVM_USDHL, safe_amount)
+        logger.info(f"Borrowing USDHL {safe_amount:.2f} ({safe_amount_wei} wei) ~ {price:=.4f}")
+        Hypurr.borrow(self.w3_hle, self.acc, HL_EVM_USDHL, safe_amount_wei)
+
+    def act_swap_harmonix_usdhl2usde(self):
+        size = self.rnd.uniform(0.4, 0.6)  # 40% - 60% of token balance
+        dep = Erc20.balance(self.w3_hle, HL_EVM_USDHL, self.acc.address)
+        dep = int(dep * size)
+        logger.debug(f"Swapping USDHL to USDE via Harmonix: {dep} (size {size:.2%})")
+        Harmonix.swap(self.w3_hle, self.acc, HL_EVM_USDHL, HL_EVM_USDE, dep)
+
+    def act_swap_harmonix_usde2usdhl(self):
+        bal = Erc20.balance(self.w3_hle, HL_EVM_USDE, self.acc.address)
+        logger.debug(f"Swapping USDE to USDHL via Harmonix: {bal}")
+        Harmonix.swap(self.w3_hle, self.acc, HL_EVM_USDE, HL_EVM_USDHL, bal)
+
+    def act_hypurr_repay_usdhl(self):
+        # just repay all balance, hyppurr will handle max repayable amount
+        bal1 = Erc20.balance(self.w3_hle, HL_EVM_USDHL, self.acc.address)
+        Hypurr.repay(self.w3_hle, self.acc, HL_EVM_USDHL, bal1)
+        bal2 = Erc20.balance(self.w3_hle, HL_EVM_USDHL, self.acc.address)
+
+        decimals = Erc20.decimals(self.w3_hle, HL_EVM_USDHL)
+        bal1, bal2 = bal1 / (10**decimals), bal2 / (10**decimals)
+        logger.info(f"USDHL balance after repay: {bal2} (was {bal1})")
+
+    def act_hypurr_redeem_ueth(self):
+        # keep small amount for percentage fees
+        bal = max(Erc20.balance(self.w3_hle, HL_EVM_HYUETH, self.acc.address) - 5, 0)
+        print(f"Withdrawing UETH balance: {bal}")
+        Hypurr.withdraw(self.w3_hle, self.acc, HL_EVM_UETH, bal)
+
+    def act_cex_dep_eth(self):
+        if not WrkCfg.cex_withdraw:
+            logger.info("CEX withdraw disabled, skipping ETH deposit")
+            return
+
+        assert self.cex_addr is not None, "CEX address not set for ETH deposit"
+        eth_bal = self.w3_bse.eth.get_balance(self.acc.address)
+        self.state.setitem("_eth_balance_before_cex_dep", eth_bal)
+
+        eth_dep = eth_bal - int(0.003 * 1e18)  # keep some founds on wallet ~ 6-8 USD
+        eth_dep = round(eth_dep / 1e14) * int(1e14)  # floor to 0.0001 ETH precision
+
+        bal_dec = eth_bal / 1e18
+        dep_dec = eth_dep / 1e18
+        left_dec = (eth_bal - eth_dep) / 1e18
+        logger.debug(f"ETH now: {bal_dec:.6f}, dep: {dep_dec:.6f}, left: {left_dec:.6f}")
+        assert dep_dec > 0.05, f"Not enough ETH to deposit: {dep_dec} ETH"
+
+        cex_addr = to_addr(self.w3_bse, self.cex_addr)
+        logger.debug(f"CEX ETH deposit address: {cex_addr}")
+        evm_transfer(self.w3_bse, self.acc, cex_addr, eth_dep)
+
+    def act_cex_dep_eth_wait(self):
+        if not WrkCfg.cex_withdraw:
+            logger.info("CEX withdraw disabled, skipping ETH deposit wait")
+            return
+
+        was_bal = self.state.getorfail("_eth_balance_before_cex_dep")
+        while True:
+            now_bal = self.w3_bse.eth.get_balance(self.acc.address)
+            if now_bal < was_bal:
+                logger.info(f"CEX ETH deposit completed: new ETH balance {now_bal / 1e18:.6f}")
+                self.state.delitem("_eth_balance_before_cex_dep")
+                break
+
+            logger.info(f"Waiting for CEX ETH deposit... current balance: {now_bal / 1e18:.6f}")
+            time.sleep(15)
+
+    def act_initialize2(self):
+        was_eth = self.w3_arb.eth.get_balance(self.acc.address)
+        self.state.setitem("_eth_before", was_eth)
+
+    def act_finalize2(self):
+        was_eth = self.state.getorfail("_eth_before")
+        now_eth = self.w3_bse.eth.get_balance(self.acc.address)
+        cost = floor_to_precision((was_eth - now_eth) / 1e18, 0.0001)
+        self.state.setitem("_cost", cost)
+        self.state.delitem("_eth_before")
+        logger.info(f"Worker: done, cost = {cost:.4f} ETH")
+
+    def route2_4(self):
+        return [
+            self.act_check,
+            self.act_cex_withdraw_eth,
+            self.act_cex_withdraw_eth_wait,
+            self.act_initialize2,
+            # from Arbitrum to HL EVM
+            self.act_bridge_arb2eth_eth,
+            self.act_bridge_arb2eth_eth_wait,
+            self.act_unit_dep_eth,
+            self.act_unit_dep_eth_wait,
+            self.act_hl_move_ueth_to_evm,
+            # borrow stables
+            self.act_swap_ueth2usdhl_fees,
+            self.act_hypurr_supply_ueth,
+            self.act_hypurr_borrow_usdhl,
+            self.act_swap_harmonix_usdhl2usde,
+            # todo: something smarter here?
+            self.act_sleep,
+            self.act_swap_harmonix_usde2usdhl,
+            self.act_hypurr_repay_usdhl,
+            self.act_hypurr_redeem_ueth,
+            self.act_swap_usdhl2ueth_all,
+            self.act_bridge_hle2base_eth,
+            self.act_bridge_hle2base_eth_wait,
+            self.act_finalize2,
+            self.act_cex_dep_eth,
+            self.act_cex_dep_eth_wait,
+            self.act_final,
+        ]
+
+    def route3(self):
+        return []
+
+
+def get_privkeys_to_process(route_name: str) -> list[str]:
+    processed = set()
+    unfinished = set()
+
+    try:
+        with open(".hl-workers.json") as fp:
+            items = json.load(fp)
+            items = [x for x in items if x.get("_route") == route_name]
+            for item in items:
+                addr = item["_addr"].lower()
+                done = _is_finished_state(item)
+                processed.add(addr) if done else unfinished.add(addr)
+    except Exception as e:
+        logger.warning(f"Failed to load worker state file: {type(e)}: {e}")
+
+    assert len(unfinished) <= 1, "Multiple unfinished wallets found: cannot proceed"
+    touched = processed.union(unfinished)
+
+    wallets = get_bw_wallets("_kk")
+    to_process1 = [x for x in wallets if x.address in unfinished]
+    to_process2 = [x for x in wallets if x.address not in touched]
+    to_process = to_process1 + to_process2
+    labels = [x.label for x in to_process]
+    logger.info(f"Wallets to process ({len(labels)}): {' '.join(labels)}")
+    return [x.privkey for x in to_process]
+
 
 def main():
+    # WrkCfg.cex_withdraw = False
+
     CltManager.load_proxies("_proxies.txt")
     cex_mapping = load_cex_mapping("_cex_map.txt")
 
-    privkey = os.getenv("EVM_PRIV_KEY")
-    assert privkey is not None, "EVM_PRIV_KEY not set"
+    # privkey = os.getenv("EVM_PRIV_KEY")
+    # assert privkey is not None, "EVM_PRIV_KEY not set"
 
-    acc = Web3().eth.account.from_key(privkey)
-    cex_addr = cex_mapping.get(str(acc.address).lower())
-    assert cex_addr, f"CEX address not found for {acc.address}"
+    route_fn = Worker.route2_4
+    for privkey in get_privkeys_to_process(route_fn.__name__):
+        acc = Web3().eth.account.from_key(privkey)
+        cex_addr = cex_mapping.get(str(acc.address).lower())
+        assert cex_addr, f"CEX address not found for {acc.address}"
 
-    wrk = Worker(acc, cex_addr)
-    wrk.run()
+        wrk = Worker(acc, cex_addr)
+        wrk.run(getattr(wrk, route_fn.__name__))
+
+        wait_sec = random.uniform(10, 20) * 60  # from 10 to 20 minutes
+        logger.info(f"Main: waiting for {wait_sec / 60:.2f} min before next wallet")
+        time.sleep(wait_sec)
 
 
 if __name__ == "__main__":

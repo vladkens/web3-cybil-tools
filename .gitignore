@@ -4,3 +4,4 @@ _wallets.txt
 .*.json
 .cache/
 .env
+_*.txt

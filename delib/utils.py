@@ -4,11 +4,18 @@ import random
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from typing import TypeVar
 
 import httpx
 from fake_useragent import UserAgent
 
 from .filecache import sqlcache
+
+T = TypeVar("T")
+
+
+def first(items: list[T]) -> T | None:
+    return items[0] if items else None
 
 
 def fake_ua() -> str:

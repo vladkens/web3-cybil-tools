@@ -7,10 +7,11 @@ from eth_account.messages import encode_defunct, encode_typed_data
 from hyperliquid.utils.signing import user_signed_payload
 from loguru import logger
 
-from .evm import Erc20, LocalAccount, Web3, evm_call, to_addr
+from .evm import Erc20, LocalAccount, Web3, _evm_dump_params, evm_call, to_addr
 from .utils import CltManager
 
-DEFAULT_SLIPPAGE = 0.0075  # 0.75%
+# DEFAULT_SLIPPAGE = 0.0075  # 0.75%
+DEFAULT_SLIPPAGE = 0.01  # 1%
 HYPURR_FI = "0xceCcE0EB9DD2Ef7996e01e25DD70e461F918A14b"
 
 
@@ -241,6 +242,20 @@ class Hypurr:
             "ltv": result[4],
             "healthFactor": result[5],
         }
+
+    @classmethod
+    def get_safe_bal(cls, w3: Web3, ac: LocalAccount, ltv_rate: float) -> float:
+        dat = Hypurr.get_account_data(w3, ac.address)
+        decimals = 10**8  # USD-like token
+
+        all_bal = dat["totalCollateral"] / decimals
+        can_bal = dat["availableBorrows"] / decimals
+        max_ltv = dat["availableBorrows"] / dat["totalCollateral"]
+        safe_ltv = max_ltv * ltv_rate
+        safe_bal = all_bal * safe_ltv
+        logger.info(f"Borrow rates {max_ltv=:.2%} {safe_ltv=:.2%}")
+        logger.info(f"Borrow collateral {all_bal=:.2f} {can_bal=:.2f} {safe_bal=:.2f}")
+        return safe_bal
 
     @classmethod
     def borrow(cls, w3: Web3, ac: LocalAccount, caddr: str, amount: int) -> str:
@@ -474,6 +489,7 @@ class Valantis:
             headers={"authorization": "Bearer f2ffd7876ec03f1f4a04ed88402b1802"},
         )
         rep.raise_for_status()
+        # print(rep.status_code, rep.text), exit(-1)
 
         res = rep.json()
         return {x["address"].lower(): float(x["price"]) for x in res}
@@ -527,14 +543,18 @@ class Harmonix:
         rep = clt.post(
             "https://aggregator-api.kyberswap.com/hyperevm/api/v1/route/build",
             json={
-                "deadline": int(time.time()),
+                "deadline": int(time.time()) + 2 * 60,
                 "recipient": ac.address,
                 "sender": ac.address,
-                "slippageTolerance": int(DEFAULT_SLIPPAGE * 1000),
+                "slippageTolerance": int(DEFAULT_SLIPPAGE * 10000),
                 "source": "harmonix",
                 "routeSummary": res["routeSummary"],
             },
         )
+
+        if rep.status_code != 200:
+            print(rep.status_code, rep.text)
+            exit(1)
 
         rep.raise_for_status()
         res = rep.json()
@@ -594,3 +614,131 @@ class Hyperliquid:
         logger.debug(f"hl_legal_sign: {rep.status_code} {rep.text}")
         rep.raise_for_status()
         return True
+
+
+class Jumper:
+    @classmethod
+    def mk_clt(cls, addr: str):
+        hdr = {
+            "origin": "https://jumper.exchange",
+            "referer": "https://jumper.exchange/",
+            "x-lifi-integrator": "jumper.exchange",
+            "x-lifi-sdk": "3.13.3",
+            "x-lifi-widget": "3.34.2",
+        }
+        return CltManager.create(addr, hdr)
+
+    @classmethod
+    def bridge(
+        cls, w3: Web3, ac: LocalAccount, from_chain: str, to_chain: str, token: str, amount: float
+    ):
+        clt = cls.mk_clt(ac.address)
+
+        chains = {
+            "arb": 42161,
+            "base": 8453,
+            "eth": 1,
+            "hle": 999,
+        }
+
+        NULL_ADDR = "0x0000000000000000000000000000000000000000"
+        mapping = {
+            "eth": {
+                "arb": NULL_ADDR,
+                "base": NULL_ADDR,
+                "eth": NULL_ADDR,
+                "hle": "0xbe6727b535545c67d5caa73dea54865b92cf7907",
+            }
+        }
+
+        from_chain_id = chains.get(from_chain.lower())
+        to_chain_id = chains.get(to_chain.lower())
+        assert from_chain_id is not None, f"Unsupported from chain: {from_chain}"
+        assert to_chain_id is not None, f"Unsupported to chain: {to_chain}"
+        assert from_chain_id != to_chain_id, "From and to chains must be different"
+
+        faddr = mapping.get(token.lower(), {}).get(from_chain.lower())
+        taddr = mapping.get(token.lower(), {}).get(to_chain.lower())
+        assert faddr is not None, f"Unsupported from token: {token} on {from_chain}"
+        assert taddr is not None, f"Unsupported to token: {token} on {to_chain}"
+
+        url = "https://api.jumper.exchange/pipeline/v1/advanced/routes"
+        pld = {
+            "fromAddress": str(ac.address),
+            "fromAmount": int(amount),
+            "fromChainId": from_chain_id,
+            "fromTokenAddress": faddr,
+            "toChainId": to_chain_id,
+            "toTokenAddress": taddr,
+            "options": {
+                "integrator": "jumper.exchange",
+                "order": "CHEAPEST",
+                "maxPriceImpact": 0.4,
+                "allowSwitchChain": True,
+                "executionType": "all",
+            },
+        }
+
+        rep = clt.post(url, json=pld)
+        rep.raise_for_status()
+
+        routes = rep.json()["routes"]
+        assert len(routes) > 0, "No routes found"
+
+        for route in routes:
+            est_time = 0
+            for step in route["steps"]:
+                est_time += step["estimate"]["executionDuration"]
+            route["estimatedTime"] = est_time
+
+        max_sec = 60 * 3  # 3 minutes
+        routes = [x for x in routes if x["estimatedTime"] <= max_sec]
+        routes = [x for x in routes if len(x["steps"]) == 1]
+        assert len(routes) > 0, "No suitable routes found"
+
+        est = routes[0]["steps"][0]["estimate"]
+        # print(json.dumps(est)), exit(1)
+
+        # note: this is simplified version, UI do it differently:
+        # 1. approve permit2 for Infinity spending
+        # 2. sign permit2 permit, merge it with res["transactionRequest"] and sent to est["permit2ProxyAddress"]
+        # see: callDiamondWithPermit2 / https://github.com/gmh5225/contracts-LI.FI/blob/main/docs/Permit2Proxy.md
+        # BUT option with two separate approvals also and raw swap tx also works
+        if faddr != NULL_ADDR:
+            amount = int(est["fromAmount"])
+            if "approvalAddress" in est:
+                logger.debug(f"check approve spender: {faddr} to {est['approvalAddress']}")
+                Erc20.check_approve(w3, ac, faddr, est["approvalAddress"], amount)
+
+            if "permit2Address" in est:
+                logger.debug(f"check approve permit2: {faddr} to {est['permit2Address']}")
+                Erc20.check_approve(w3, ac, faddr, est["permit2Address"], amount)
+
+        url = "https://api.jumper.exchange/pipeline/v1/advanced/stepTransaction"
+        rep = clt.post(url, json=routes[0]["steps"][0])
+        rep.raise_for_status()
+        res = rep.json()
+        # print(json.dumps(res))
+
+        # re-check time estimate
+        est = res["estimate"]
+        exec_time = int(est["executionDuration"])
+        assert exec_time <= max_sec, f"execution time too long: {exec_time}s"
+
+        # re-check price impact
+        fbal = float(est["fromAmountUSD"])
+        tbal = float(est["toAmountUSD"])
+        price_impact = 1 - (tbal / fbal)
+        logger.debug(f"price impact: {price_impact:.3%} ({fbal:.3f} -> {tbal:.3f} in USD)")
+        if price_impact > DEFAULT_SLIPPAGE:
+            raise SlippageError(f"Price impact too high: {price_impact:.3%}")
+
+        params = res["transactionRequest"]
+        logger.debug(f"tx params0: {_evm_dump_params(params)}")
+        params["gas"] = int(params.get("gasLimit", 0), 16)
+
+        for td in ["gasPrice", "gasLimit"]:
+            if td in params:
+                del params[td]
+
+        return evm_call(w3, ac, params)
