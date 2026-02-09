@@ -1,5 +1,4 @@
 import json
-import os
 import random
 import time
 from datetime import UTC, datetime
@@ -17,7 +16,7 @@ from loguru import logger
 from web3 import Web3
 
 from delib import CltManager, Erc20, Erc4626, cex, dex, evm_call, to_addr
-from delib.dex import Harmonix, Hyperliquid, HyperUnit, Hypurr, SlippageError, Valantis
+from delib.dex import Hyperliquid, HyperUnit, Hypurr, SlippageError, Valantis
 from delib.utils import cmd_say, get_bw_wallets, load_cex_mapping
 
 
@@ -546,7 +545,7 @@ class Worker:
         self.state.setitem("vault_felix", v1_bal)
         self.state.setitem("vault_sentiment", v2_bal)
         self.state.setitem("swap_hypurr", swap1_bal)
-        self.state.setitem("swap_harmonix", swap2_bal)
+        self.state.setitem("swap_valantis", swap2_bal)
 
     def act_supply_felix(self):
         dep = self.state.getorfail("vault_felix")
@@ -565,10 +564,10 @@ class Worker:
         dep = _to_wei_erc(self.w3_hle, self.acc, HL_EVM_USDE, dep)
         Hypurr.swap(self.w3_hle, self.acc, HL_EVM_USDE, HL_EVM_USDT, dep)
 
-    def act_swap_usde2usdt_harmonix(self):
-        dep = self.state.getorfail("swap_harmonix")
+    def act_swap_usde2usdt_valantis(self):
+        dep = self.state.getorfail("swap_valantis")
         dep = _to_wei_erc(self.w3_hle, self.acc, HL_EVM_USDE, dep)
-        Harmonix.swap(self.w3_hle, self.acc, HL_EVM_USDE, HL_EVM_USDT, dep)
+        Valantis.swap(self.w3_hle, self.acc, HL_EVM_USDE, HL_EVM_USDT, dep)
 
     def act_hypurr_supply_usdt(self):
         bal = Erc20.balance(self.w3_hle, HL_EVM_USDT, self.acc.address)
@@ -627,9 +626,9 @@ class Worker:
         logger.debug(f"Swapping USDT to USDE via Hypurr: {dep} (all {bal})")
         Hypurr.swap(self.w3_hle, self.acc, HL_EVM_USDT, HL_EVM_USDE, dep)
 
-    def act_swap_usdt2usde_harmonix(self):
+    def act_swap_usdt2usde_valantis(self):
         bal = Erc20.balance(self.w3_hle, HL_EVM_USDT, self.acc.address)
-        Harmonix.swap(self.w3_hle, self.acc, HL_EVM_USDT, HL_EVM_USDE, bal)
+        Valantis.swap(self.w3_hle, self.acc, HL_EVM_USDT, HL_EVM_USDE, bal)
 
     def act_redeem_felix(self):
         bal = Erc20.balance(self.w3_hle, HL_FELIX_USDE, self.acc.address)
@@ -844,7 +843,7 @@ class Worker:
             self.act_supply_felix,
             self.act_supply_sentiment,
             self.act_swap_usde2usdt_hypurr,
-            self.act_swap_usde2usdt_harmonix,
+            self.act_swap_usde2usdt_valantis,
             self.act_hypurr_supply_usdt,
             self.act_hypurr_borrow_ueth,
             # todo: something better then out / in
@@ -858,7 +857,7 @@ class Worker:
             self.act_hypurr_redeem_usdt,
             self.act_swap_ueth2usdt_hypurr,
             self.act_swap_usdt2usde_hypurr,
-            self.act_swap_usdt2usde_harmonix,
+            self.act_swap_usdt2usde_valantis,
             self.act_redeem_felix,
             self.act_redeem_sentiment,
             self.act_hl_usde_from_evm,
@@ -923,13 +922,19 @@ class Worker:
         bal = Erc20.balance(self.w3_hle, HL_EVM_UETH, self.acc.address)
         assert bal > gap, f"Not enough UETH balance to swap small USDHL: {bal} <= {gap}"
 
-        logger.debug(f"Swapping small UETH to USDHL via Harmonix: {gap}")
-        Harmonix.swap(self.w3_hle, self.acc, HL_EVM_UETH, HL_EVM_USDHL, gap)
+        logger.debug(f"Swapping small UETH to USDHL: {gap}")
+        Valantis.swap(self.w3_hle, self.acc, HL_EVM_UETH, HL_EVM_USDHL, gap)
 
     def act_swap_usdhl2ueth_all(self):
         bal = Erc20.balance(self.w3_hle, HL_EVM_USDHL, self.acc.address)
-        logger.debug(f"Swapping all USDHL to UETH via Harmonix: {bal}")
-        Harmonix.swap(self.w3_hle, self.acc, HL_EVM_USDHL, HL_EVM_UETH, bal)
+        dec = Erc20.decimals(self.w3_hle, HL_EVM_USDHL)
+        bal_dec = bal / (10**dec)
+        logger.info(f"Swapping all USDHL to UETH: {bal_dec:.2f} ({bal} wei)")
+        if bal_dec < 0.1:
+            logger.warning("Low USDHL balance, skipping swap")
+            return
+
+        Valantis.swap(self.w3_hle, self.acc, HL_EVM_USDHL, HL_EVM_UETH, bal)
 
     def act_hypurr_supply_ueth(self):
         bal = Erc20.balance(self.w3_hle, HL_EVM_UETH, self.acc.address)
@@ -949,17 +954,17 @@ class Worker:
         logger.info(f"Borrowing USDHL {safe_amount:.2f} ({safe_amount_wei} wei) ~ {price:=.4f}")
         Hypurr.borrow(self.w3_hle, self.acc, HL_EVM_USDHL, safe_amount_wei)
 
-    def act_swap_harmonix_usdhl2usde(self):
+    def act_swap_usdhl2usde(self):
         size = self.rnd.uniform(0.4, 0.6)  # 40% - 60% of token balance
         dep = Erc20.balance(self.w3_hle, HL_EVM_USDHL, self.acc.address)
         dep = int(dep * size)
-        logger.debug(f"Swapping USDHL to USDE via Harmonix: {dep} (size {size:.2%})")
-        Harmonix.swap(self.w3_hle, self.acc, HL_EVM_USDHL, HL_EVM_USDE, dep)
+        logger.debug(f"Swapping USDHL to USDE: {dep} (size {size:.2%})")
+        Valantis.swap(self.w3_hle, self.acc, HL_EVM_USDHL, HL_EVM_USDE, dep)
 
-    def act_swap_harmonix_usde2usdhl(self):
+    def act_swap_usde2usdhl(self):
         bal = Erc20.balance(self.w3_hle, HL_EVM_USDE, self.acc.address)
-        logger.debug(f"Swapping USDE to USDHL via Harmonix: {bal}")
-        Harmonix.swap(self.w3_hle, self.acc, HL_EVM_USDE, HL_EVM_USDHL, bal)
+        logger.debug(f"Swapping USDE to USDHL: {bal}")
+        Valantis.swap(self.w3_hle, self.acc, HL_EVM_USDE, HL_EVM_USDHL, bal)
 
     def act_hypurr_repay_usdhl(self):
         # just repay all balance, hyppurr will handle max repayable amount
@@ -1043,10 +1048,10 @@ class Worker:
             self.act_swap_ueth2usdhl_fees,
             self.act_hypurr_supply_ueth,
             self.act_hypurr_borrow_usdhl,
-            self.act_swap_harmonix_usdhl2usde,
+            self.act_swap_usdhl2usde,
             # todo: something smarter here?
             self.act_sleep,
-            self.act_swap_harmonix_usde2usdhl,
+            self.act_swap_usde2usdhl,
             self.act_hypurr_repay_usdhl,
             self.act_hypurr_redeem_ueth,
             self.act_swap_usdhl2ueth_all,
@@ -1057,9 +1062,6 @@ class Worker:
             self.act_cex_dep_eth_wait,
             self.act_final,
         ]
-
-    def route3(self):
-        return []
 
 
 def get_privkeys_to_process(route_name: str) -> list[str]:

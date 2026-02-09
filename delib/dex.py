@@ -1,4 +1,5 @@
 import json
+import math
 import textwrap
 import time
 from datetime import UTC, datetime
@@ -390,35 +391,33 @@ class Valantis:
 
     @classmethod
     def swap(cls, w3: Web3, ac: LocalAccount, src_token: str, dst_token: str, amount: int):
-        raise NotImplementedError("Valantis changed API, use different DEX for now")
-
         src_token = to_addr(w3, src_token)
         dst_token = to_addr(w3, dst_token)
 
+        # valantis works with human-readable amounts
+        decimals = Erc20.decimals(w3, src_token)
+        assert decimals is not None, f"Cannot get decimals for token {src_token}"
+        amount_hum = math.floor(amount / (10**decimals) * 10_000) / 10_000
+
+        url = "https://analytics-v3.valantis-analytics.xyz/liquidswap"
+        hdr = {"authorization": "Bearer f2ffd7876ec03f1f4a04ed88402b1802"}
         pld = {
             "inputToken": str(src_token),
             "outputToken": str(dst_token),
-            "inputAmount": str(amount),
-            "userAddress": str(ac.address),
+            "inputAmount": str(amount_hum),
             "outputReceiver": str(ac.address),
-            "chainID": "hyperevm",
-            "isPermit2": False,
         }
 
         clt = cls.mk_clt(ac.address)
-        rep = clt.post(
-            "https://analytics-v3.valantis-analytics.xyz/gluex_quote_with_surplus",
-            headers={"authorization": "Bearer f2ffd7876ec03f1f4a04ed88402b1802"},
-            json=pld,
-        )
+        rep = clt.post(url, headers=hdr, json=pld)
         rep.raise_for_status()
 
         res = rep.json()
         assert "statusCode" in res and "result" in res, f"GlueX swap quote failed: {res}"
-        assert res["statusCode"] == 200, f"GlueX swap quote failed: {res}"
-        logger.debug(f"valantis_swap: {json.dumps(res)}")
-        res = res["result"]
+        assert res["statusCode"] == 200, f"Valantis swap quote failed: {res}"
+        # logger.debug(f"valantis_swap: {json.dumps(res)}")
 
+        res = res["result"]
         assert "calldata" in res and "router" in res, f"Valantis swap quote failed: {res}"
 
         # for example: "0.000443%"
@@ -426,12 +425,13 @@ class Valantis:
         if price_impact > DEFAULT_SLIPPAGE:
             raise SlippageError(f"Price impact too high: {price_impact:.3%}")
 
-        Erc20.check_approve(w3, ac, src_token, res["router"], int(res["inputAmount"]))
+        # Erc20.check_approve(w3, ac, src_token, res["router"], int(res["inputAmount"]))
+        Erc20.check_approve(w3, ac, src_token, res["router"], amount)
 
         params = {
             "to": to_addr(w3, res["router"]),
             "data": res["calldata"],
-            "gas": int(res["computationUnits"]),
+            # "gas": int(res["computationUnits"]),
         }
 
         return evm_call(w3, ac, params)
@@ -546,7 +546,7 @@ class Harmonix:
                 "deadline": int(time.time()) + 2 * 60,
                 "recipient": ac.address,
                 "sender": ac.address,
-                "slippageTolerance": int(DEFAULT_SLIPPAGE * 10000),
+                "slippageTolerance": int(DEFAULT_SLIPPAGE * 1000),
                 "source": "harmonix",
                 "routeSummary": res["routeSummary"],
             },

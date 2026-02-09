@@ -115,7 +115,7 @@ class BWWallet:
 def get_bw_wallets(name: str) -> list[BWWallet]:
     out = subprocess.check_output(["bw", "get", "item", name], env=os.environ)
     out = json.loads(out.decode())
-    assert out["name"] == "_kk", f"Unexpected item name: {out['name']}"
+    assert out["name"] == name, f"Unexpected item name: {out['name']}"
     assert out["type"] == 2, f"Unexpected item type: {out['type']}"
 
     items = []
